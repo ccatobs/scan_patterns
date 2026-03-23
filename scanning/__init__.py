@@ -1,4 +1,3 @@
-from astropy.coordinates import EarthLocation
 import astropy.units as u
 import numpy as np
 

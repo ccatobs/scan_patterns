@@ -5,10 +5,15 @@ import warnings
 
 import numpy as np
 import pandas as pd
-from scipy.optimize import root_scalar
-from astropy.time import Time
+from astropy.time import Time, TimeDelta
 import astropy.units as u
-from astropy.coordinates import EarthLocation, SkyCoord
+from astropy.coordinates import SkyCoord
+from fyst_trajectories import get_fyst_site, Coordinates
+from fyst_trajectories.offsets import InstrumentOffset, boresight_to_detector, detector_to_boresight
+from fyst_trajectories.site import FYST_NASMYTH_PORT
+from fyst_trajectories.patterns import (
+    PongScanPattern, DaisyScanPattern, PongScanConfig, DaisyScanConfig,
+)
 
 def _central_diff(a, h=None, time=None):
 
@@ -27,7 +32,7 @@ def _central_diff(a, h=None, time=None):
 
     return new_a
 
-FYST_LOC = EarthLocation(lat='-22d59m08.30s', lon='-67d44m25.00s', height=5611.8*u.m)
+FYST_LOC = get_fyst_site().location
 
 ##################
 #  SKY PATTERN 
@@ -435,104 +440,57 @@ class Pong(SkyPattern):
         return kwargs
 
     def _generate_scan(self):
-        
+
         # unpack parameters
-        num_term = self._param['num_term']
         width = self._param['width']
         height = self._param['height']
         spacing = self._param['spacing']
         velocity = self._param['velocity']
         sample_interval = self._param['sample_interval']
 
-        angle_rad = radians(self._param['angle'])
+        # Compute period for num_repeat / max_scan_duration handling
+        vert_spacing = sqrt(2) * spacing
+        vavg = velocity / sqrt(2)
 
-        # --- START OF ALGORITHM ---
+        # Use fyst-trajectories's vertex computation (identical algorithm)
+        config = PongScanConfig(
+            num_terms=self._param['num_term'],
+            width=width,
+            height=height,
+            spacing=spacing,
+            velocity=velocity,
+            timestep=sample_interval,
+            angle=self._param['angle'],
+        )
+        pattern = PongScanPattern(ra=0.0, dec=0.0, config=config)
+        x_numvert, y_numvert, _, _ = pattern._compute_vertices()
 
-        # Determine number of vertices (reflection points) along each side of the
-        # box which satisfies the common-factors criterion and the requested size / spacing    
-
-        vert_spacing = sqrt(2)*spacing
-        x_numvert = math.ceil(width/vert_spacing)
-        y_numvert = math.ceil(height/vert_spacing)
- 
-        if x_numvert%2 == y_numvert%2:
-            if x_numvert >= y_numvert:
-                y_numvert += 1
-            else:
-                x_numvert += 1
-
-        num_vert = [x_numvert, y_numvert]
-        most_i = num_vert.index(max(x_numvert, y_numvert))
-        least_i = num_vert.index(min(x_numvert, y_numvert))
-
-        while math.gcd(num_vert[most_i], num_vert[least_i]) != 1:
-            num_vert[most_i] += 2
-        
-        x_numvert = num_vert[0]
-        y_numvert = num_vert[1]
-        assert(math.gcd(x_numvert, y_numvert) == 1)
-        assert((x_numvert%2 == 0 and y_numvert%2 == 1) or (x_numvert%2 == 1 and y_numvert%2 == 0))
-
-        # Calculate the approximate periods by assuming a Pong scan with
-        # no rounding at the corners. Average the x- and y-velocities
-        # in order to determine the period in each direction, and the
-        # total time required for the scan.
-
-        vavg = velocity/sqrt(2) # changed so velocity is TOTAL velocity and vavg is single-direction velocity
-        peri_x = x_numvert * vert_spacing * 2 / vavg
-        peri_y = y_numvert * vert_spacing * 2 / vavg
         period = x_numvert * y_numvert * vert_spacing * 2 / vavg
-
-        amp_x = x_numvert * vert_spacing / 2
-        amp_y = y_numvert * vert_spacing / 2
 
         # Determine number of repeats
         num_repeat = self._param.get('num_repeat', 1)
 
         if math.isnan(num_repeat):
-            max_scan_duration = self._param.pop('max_scan_duration') # only store number of repeats, not maximum scan duration
-            num_repeat = math.floor(max_scan_duration/period)
+            max_scan_duration = self._param.pop('max_scan_duration')
+            num_repeat = math.floor(max_scan_duration / period)
             self._param['num_repeat'] = num_repeat
 
         self._param['period'] = period
-        
-        pongcount = math.ceil(period*num_repeat/sample_interval)
-        
-        # Calculate the grid positions and apply rotation angle. Load
-        # data into a dataframe.    
 
-        t_count = 0
-        time_offset = []
-        x_coord = []
-        y_coord = []
+        # Compute duration to match original point count:
+        # pongcount = ceil(period * num_repeat / sample_interval)
+        # duration = (pongcount - 1) * sample_interval
+        pongcount = math.ceil(period * num_repeat / sample_interval)
+        duration = (pongcount - 1) * sample_interval
 
-        for i in range(pongcount):
-            x_coord1 = self._fourier_expansion(num_term, amp_x, t_count, peri_x)
-            y_coord1 = self._fourier_expansion(num_term, amp_y, t_count, peri_y)
+        # Generate offsets via fyst-trajectories
+        times, x_off, y_off = pattern.generate_offsets(duration=duration)
 
-            x_coord.append(x_coord1*cos(angle_rad) - y_coord1*sin(angle_rad))
-            y_coord.append(x_coord1*sin(angle_rad) + y_coord1*cos(angle_rad))
-            time_offset.append(t_count)
-            t_count += sample_interval
-        
-        # repeat pattern if necessary 
         return pd.DataFrame({
-            'time_offset': time_offset, 
-            'x_coord': x_coord, 'y_coord': y_coord,
+            'time_offset': times,
+            'x_coord': x_off, 'y_coord': y_off,
         })
-    
-    def _fourier_expansion(self, num_term, amp, t_count, peri):
-        N = num_term*2 - 1
-        a = (8*amp)/(pi**2)
-        b = 2*pi/peri
 
-        pos = 0
-        for n in range(1, N+1, 2):
-            c = math.pow(-1, (n-1)/2)/n**2 
-            pos += c * sin(b*n*t_count)
-
-        pos *= a
-        return pos
 
 class Daisy(SkyPattern):
     """
@@ -615,132 +573,26 @@ class Daisy(SkyPattern):
         
     def _generate_scan(self):
 
-        # unpack parameters
-        param = self.param
+        # unpack parameters (already cleaned to floats in degrees/seconds)
+        T = self._param['T']
 
-        speed = param['velocity'].to(u.arcsec/u.s).value
-        start_acc = param['start_acc'].to(u.arcsec/u.s/u.s).value
-        R0 = param['R0'].to(u.arcsec).value
-        Rt = param['Rt'].to(u.arcsec).value
-        Ra = param['Ra'].to(u.arcsec).value
-        T = param['T'].to(u.s).value
-        dt = param['sample_interval'].to(u.s).value
-        y_offset = param['y_offset'].to(u.arcsec).value
+        # Generate offsets via fyst-trajectories
+        config = DaisyScanConfig(
+            radius=self._param['R0'],
+            velocity=self._param['velocity'],
+            turn_radius=self._param['Rt'],
+            avoidance_radius=self._param['Ra'],
+            start_acceleration=self._param['start_acc'],
+            y_offset=self._param['y_offset'],
+            timestep=self._param['sample_interval'],
+        )
+        pattern = DaisyScanPattern(ra=0.0, dec=0.0, config=config)
+        times, x_off, y_off = pattern.generate_offsets(duration=T)
 
-        # If the sample rate is too low, sample at a higher frequency 
-        # and then only take a subset. 
-
-        good_dt = 1/150
-        if (dt > good_dt):
-            sample_every = math.ceil(dt/good_dt)
-            dt = dt/sample_every
-        else:
-            sample_every = 1
-
-            
-        # --- START OF ALGORITHM ---
-
-        # Tangent vector & start value
-        (vx, vy) = (1.0, 0.0) 
-
-        # Position vector & start value
-        (x, y) = (0.0, y_offset) 
-
-        # number of steps 
-        N = int(T/dt)
-
-        # x, y arrays for storage
-        x_coord = np.empty(N)
-        y_coord = np.empty(N)
-        #x_vel = np.empty(N)
-        #y_vel = np.empty(N)
-        test = []
-        
-        # Effective avoidance radius so Ra is not used if Ra > R0 
-        #R1 = min(R0, Ra) 
-
-        s0 = speed 
-        speed = 0 
-        for step in range(N): 
-
-            # Ramp up speed with acceleration start_acc 
-            # to limit startup transients. Telescope has zero speed at startup. 
-            speed += start_acc*dt 
-            if speed >= s0: 
-                speed = s0 
-
-            r = sqrt(x*x + y*y) 
-
-            # Straight motion inside R0 
-            if r < R0: 
-                x += vx*speed*dt 
-                y += vy*speed*dt 
-
-            # Motion outside R0
-            else: 
-                (xn,yn) = (x/r,y/r) # Compute unit radial vector 
-
-                # If aiming close to center, resume straight motion
-                # seems to only apply for the initial large turn 
-                if (-xn*vx - yn*vy) > sqrt(1 - Ra*Ra/r/r): #if (-xn*vx - yn*vy) > 1/sqrt(1 + (Ra/r)**2):
-                    x += vx*speed*dt 
-                    y += vy*speed*dt 
-
-                # Otherwise decide turning direction
-                else: 
-                    if (-xn*vy + yn*vx) > 0: 
-                        Nx = vy 
-                        Ny = -vx 
-                    else: 
-                        Nx = -vy 
-                        Ny = vx 
-
-                    # Compute curved trajectory using serial exansion in step length s 
-                    s = speed*dt 
-                    x += (s - s*s*s/Rt/Rt/6)*vx + s*s/Rt/2*Nx 
-                    y += (s - s*s*s/Rt/Rt/6)*vy + s*s/Rt/2*Ny 
-                    vx += -s*s/Rt/Rt/2*vx + (s/Rt + s*s*s/Rt/Rt/Rt/6)*Nx 
-                    vy += -s*s/Rt/Rt/2*vy + (s/Rt + s*s*s/Rt/Rt/Rt/6)*Ny 
-
-                    # NOTE converting back into a unit vector, for long interations, the Daisy pattern starts spiraling out otherwise
-                    total_v = sqrt(vx**2 + vy**2)
-                    vx = vx/total_v
-                    vy = vy/total_v
-
-                    test.append(sqrt(vx**2 + vy**2))
-
-            # Store result for plotting and statistics
-            x_coord[step] = x
-            y_coord[step] = y
-            #x_vel[step] = speed*vx
-            #y_vel[step] = speed*vy
-
-        """
-        ax = -2*xval[1: -1] + xval[0:-2] + xval[2:] # numerical acc in x 
-        ay = -2*yval[1: -1] + yval[0:-2] + yval[2:] # numerical acc in y 
-        x_acc = np.append(np.array([0]), ax/dt/dt)
-        y_acc = np.append(np.array([0]), ay/dt/dt)
-        x_acc = np.append(x_acc, 0)
-        y_acc = np.append(y_acc, 0)
-        """
-        
-        # check if pattern has spiraled
-        total_R = sqrt(R0**2 - 2*Rt*Ra + Rt**2) + Rt
-        last_R = sqrt(x_coord[-1]**2 + y_coord[-1]**2)
-
-        if last_R >= total_R + 2*Rt:
-            warnings.warn('This Daisy scan may have spiraled out.')
-
-        # return data
-        data =  pd.DataFrame({
-            'time_offset': np.arange(0, T, dt), 
-            'x_coord': x_coord/3600, 'y_coord': y_coord/3600, 
+        return pd.DataFrame({
+            'time_offset': times,
+            'x_coord': x_off, 'y_coord': y_off,
         })
-
-        if sample_every == 1:
-            return data
-        else:
-            return data.iloc[::sample_every, :]
  
 #######################
 #  TELESCOPE PATTERN 
@@ -910,6 +762,45 @@ class TelescopePattern():
         elif len(self.alt_coord.value[(self.alt_coord.value < 30) | (self.alt_coord.value > 75)]) > 0:
             warnings.warn('elevation has values outside of 30 to 75 range')
 
+    @classmethod
+    def from_trajectory(cls, trajectory, instrument=None, data_loc='boresight', **kwargs):
+        """Create TelescopePattern from a fyst-trajectories Trajectory.
+
+        Parameters
+        ----------
+        trajectory : fyst_trajectories.Trajectory
+            A trajectory generated by fyst-trajectories (e.g., from ConstantElScanPattern).
+            Must have a start_time set. The trajectory must have uniform timesteps
+            (scan_patterns requires a constant sample interval). ``trajectory.times``
+            should be seconds from zero.
+        instrument : Instrument, optional
+            Instrument for detector offset calculations.
+        data_loc : str, optional
+            Module location for scanning center. Default 'boresight'.
+        **kwargs
+            Additional keyword arguments passed to TelescopePattern.__init__.
+        """
+        if trajectory.start_time is None:
+            raise ValueError("Trajectory must have start_time set")
+
+        site = get_fyst_site()
+
+        # Compute absolute times and LST
+        abs_times = trajectory.start_time + TimeDelta(trajectory.times * u.s)
+        lst = abs_times.sidereal_time('apparent', longitude=site.location.lon)
+        lst_hourangle = lst.to(u.hourangle).value
+
+        data = pd.DataFrame({
+            'time_offset': trajectory.times,
+            'az_coord': trajectory.az,
+            'alt_coord': trajectory.el,
+            'lst': lst_hourangle,
+        })
+
+        tp = cls(data, instrument=instrument, data_loc=data_loc, **kwargs)
+        tp.scan_flag = getattr(trajectory, 'scan_flag', None)
+        return tp
+
     def _clean_param_sky_pattern(self, **kwargs):
         kwarg_keys = kwargs.keys()
         new_kwargs = dict()
@@ -967,10 +858,37 @@ class TelescopePattern():
 
     def _from_sky_pattern(self, sky_pattern):
 
+        param = self.param
+
+        if 'start_datetime' in self._param:
+            # Use fyst-trajectories for accurate conversion (spherical offsets,
+            # apparent sidereal time, precession/nutation).
+            site = get_fyst_site()
+            coords = Coordinates(site)
+
+            start_time = Time(param['start_datetime'])
+            dt_seconds = sky_pattern.time_offset.to(u.s).value
+            obstimes = start_time + TimeDelta(dt_seconds * u.s)
+
+            x_offsets = sky_pattern.x_coord.to(u.deg).value
+            y_offsets = sky_pattern.y_coord.to(u.deg).value
+            ra_center = param['start_ra'].to(u.deg).value
+            dec_center = param['start_dec'].to(u.deg).value
+
+            # Convert sky offsets (RA/Dec plane) to individual RA/Dec positions
+            center = SkyCoord(ra=ra_center * u.deg, dec=dec_center * u.deg)
+            positions = center.spherical_offsets_by(
+                x_offsets * u.deg, y_offsets * u.deg,
+            )
+            ra_arr = positions.ra.deg
+            dec_arr = positions.dec.deg
+
+            az, el = coords.radec_to_altaz(ra_arr, dec_arr, obstime=obstimes)
+            return az, el
+
+        # Fall back to manual formula for hour-angle/LST/elevation starts
         if max(abs(sky_pattern.x_coord.value)) > 10:
             warnings.warn('This is a larger pattern and the conversion between x and y deltas and RA/DEC may be slightly off.')
-
-        param = self.param
 
         # get alt/az
         start_dec = param['start_dec'].to(u.rad).value
@@ -987,7 +905,7 @@ class TelescopePattern():
         cos_az_rad[cos_az_rad < -1] = -1
 
         az_rad = np.arccos( cos_az_rad )
-        mask = np.sin(hour_angle_rad) > 0 
+        mask = np.sin(hour_angle_rad) > 0
         az_rad[mask] = 2*pi - az_rad[mask]
 
         return np.degrees(az_rad), np.degrees(alt_rad)
@@ -1088,71 +1006,53 @@ class TelescopePattern():
             return self.instrument.location_from_boresight(module[0], module[1]).value
 
     def _transform_to_boresight(self, az1, alt1, dist, theta):
+        # Use fyst-trajectories's spherical offset (inverse direction).
+        # Same convention mapping as _transform_from_boresight:
+        #   dx = dist * cos(theta), dy = dist * sin(theta), field_rotation = -el_bore
+        # The field_rotation depends on the unknown boresight elevation, so we
+        # iterate: guess el_bore, invert, update guess, repeat.
+        theta_rad = math.radians(theta)
+        dx_arcmin = dist * 60.0 * math.cos(theta_rad)
+        dy_arcmin = dist * 60.0 * math.sin(theta_rad)
+        offset = InstrumentOffset(dx=dx_arcmin, dy=dy_arcmin)
 
-        # convert everything into radians
-        dist = math.radians(dist)
-        theta = math.radians(theta)
-        alt1 = np.radians(alt1)
-        az1 = np.radians(az1)
+        az1 = np.asarray(az1, dtype=float)
+        alt1 = np.asarray(alt1, dtype=float)
 
-        # getting new elevation
-        def func(alt_0, alt_1):
-            return sin(alt_0)*cos(dist) + sin(dist)*cos(alt_0)*sin(theta + alt_0) - sin(alt_1)
+        # Initial guess: boresight elevation ~ detector elevation
+        bore_el = alt1.copy()
 
-        alt0 = np.empty(len(alt1))
-        guess = alt1[0]
-        for i, a1 in enumerate(alt1):
-            try:
-                a0 = root_scalar(func, args=(a1), x0=guess, bracket=[-pi/2, pi/2], xtol=10**(-9)).root
-                guess = a0
-            except ValueError:
-                print(f'nan value at {i}')
-                alt0 = math.nan
+        for _ in range(20):
+            bore_az, bore_el_new = detector_to_boresight(
+                az1, alt1, offset, field_rotation=-bore_el,
+            )
+            max_delta = np.max(np.abs(bore_el_new - bore_el))
+            bore_el = bore_el_new
+            if max_delta < 1e-12:
+                break
 
-            alt0[i]= a0
-        
-        if len(alt0[alt0 < 0]) > 0:
+        if np.any(bore_el < 0):
             warnings.warn('elevation has values below 0')
 
-        # getting new azimuth
-        #cos_diff_az0 = ( np.cos(alt0)*cos(dist) - np.sin(alt0)*sin(dist)*np.sin(theta + alt0) )/np.cos(alt1)
-        cos_diff_az0 = (cos(dist) - np.sin(alt0)*np.sin(alt1))/(np.cos(alt0)*np.cos(alt1))
-        cos_diff_az0[cos_diff_az0 > 1] = 1
-        cos_diff_az0[cos_diff_az0 < -1] = -1
-        diff_az0 = np.arccos(cos_diff_az0)
-
-        # check if diff_az is positive or negative
-        mask = (theta > -alt0 + pi/2) & (theta < -alt0 + 3*pi/2)
-        diff_az0[mask] = -diff_az0[mask]
-        az0 = az1 - diff_az0
-
-        """# check is dist is dist
-        beta = np.arcsin( np.cos(theta + alt0)*np.cos(alt0)/np.cos(alt1) )
-        alpha = pi/2 - beta + theta + alt0
-        dist_check = np.degrees(np.arcsin( np.cos(alt1)*np.sin(alpha)/np.cos(theta + alt0)  ))
-        plt.plot(dist_check)"""
-
-        return self._norm_angle(np.degrees(az0)), np.degrees(alt0)
+        return self._norm_angle(np.asarray(bore_az)), np.asarray(bore_el)
 
     def _transform_from_boresight(self, az0, alt0, dist, theta):
-        
-        # convert everything into radians
-        dist = math.radians(dist)
-        theta = math.radians(theta)
-        alt0 = np.radians(alt0)
-        az0 = np.radians(az0)
+        # Use fyst-trajectories's spherical offset (forward direction).
+        # scan_patterns convention: (dist, theta) where theta is measured from
+        # the cross-elevation axis in the Nasmyth focal plane. The sky-frame
+        # position angle is (theta + elevation). Mapping to fyst-trajectories:
+        #   dx = dist * cos(theta), dy = dist * sin(theta), field_rotation = -el
+        theta_rad = math.radians(theta)
+        dx_arcmin = dist * 60.0 * math.cos(theta_rad)
+        dy_arcmin = dist * 60.0 * math.sin(theta_rad)
+        offset = InstrumentOffset(dx=dx_arcmin, dy=dy_arcmin)
 
-        # find elevation offset
-        alt1 = np.arcsin(np.sin(alt0)*cos(dist) + sin(dist)*np.cos(alt0)*np.sin(theta + alt0))
-        if len(alt1[alt1 < 0]) > 0:
+        det_az, det_el = boresight_to_detector(az0, alt0, offset, field_rotation=-alt0)
+
+        if np.any(np.asarray(det_el) < 0):
             warnings.warn('elevation has values below 0')
 
-        # find azimuth offset
-        sin_az1 = 1/np.cos(alt1) * ( np.cos(alt0)*np.sin(az0)*cos(dist) + np.cos(az0)*np.cos(theta + alt0)*sin(dist) - np.sin(alt0)*np.sin(az0)*sin(dist)*np.sin(theta + alt0) )
-        cos_az1 = 1/np.cos(alt1) * ( np.cos(alt0)*np.cos(az0)*cos(dist) - np.sin(az0)*np.cos(theta + alt0)*sin(dist) - np.sin(alt0)*np.cos(az0)*sin(dist)*np.sin(theta + alt0) )
-        az1 = np.arctan2(sin_az1, cos_az1)
-
-        return self._norm_angle(np.degrees(az1)), np.degrees(alt1)
+        return self._norm_angle(np.asarray(det_az)), np.asarray(det_el)
 
     # METHODS
 
@@ -1163,10 +1063,11 @@ class TelescopePattern():
 
         Parameters
         ------------------------
-        module : str or two-tuple
+        module : str, two-tuple, or InstrumentOffset
             | 1. string indicating a module name in the instrument e.g. 'SFH'
             | 2. string indicating one of the default slots in the instrument e.g. 'c', 'i1'
             | 3. tuple of (distance, theta) indicating module's offset from the center of the instrument, default unit deg
+            | 4. fyst-trajectories ``InstrumentOffset`` (dx/dy in arcminutes, converted to polar internally)
         includes_instr_offset : bool, default False
             if "module" parameter is a tuple of (distance, theta), this includes the instrument offset
 
@@ -1176,7 +1077,10 @@ class TelescopePattern():
             A TelescopePattern object where the "boresight" is the path of the provided module.
         """
         
-        if includes_instr_offset:
+        if isinstance(module, InstrumentOffset):
+            dist = math.sqrt(module.dx**2 + module.dy**2) / 60.0
+            theta = math.degrees(math.atan2(module.dy, module.dx))
+        elif includes_instr_offset:
             assert(len(module) == 2)
             dist, theta = u.Quantity(module[0], u.deg).value, u.Quantity(module[1], u.deg).value
         else:
@@ -1226,13 +1130,6 @@ class TelescopePattern():
             'x_coord': dra.value,
             'y_coord': ddec.value
         }
-
-        # data = {
-        #     'time_offset': self.time_offset.value, 
-        #     # FIXME fine for small regions, but consider checking out https://docs.astropy.org/en/stable/coordinates/matchsep.html for larger regions
-        #     'x_coord': self.ra_coord.value*cos(start_dec) - self.ra_coord[0].value*cos(start_dec),
-        #     'y_coord': self.dec_coord.value - self.dec_coord[0].value 
-        # }
 
         if max(abs(data['x_coord'])) > 10:
             warnings.warn('This is a larger pattern and the conversion between x and y deltas and RA/DEC may be slightly off.')
@@ -1399,8 +1296,9 @@ class TelescopePattern():
 
     @property
     def rot_angle(self):
-        """Quantity array: Field rotation (elevation + parallactic angle)."""
-        return self._norm_angle((self.para_angle + self.alt_coord).value)*u.deg
+        """Quantity array: Field rotation (nasmyth_sign * elevation + parallactic angle)."""
+        nasmyth_sign = 1 if FYST_NASMYTH_PORT == "right" else -1
+        return self._norm_angle((nasmyth_sign * self.alt_coord + self.para_angle).value)*u.deg
 
     # Azimuthal/Elevation Motion
 

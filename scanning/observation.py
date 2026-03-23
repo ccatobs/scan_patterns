@@ -1,6 +1,5 @@
-from datetime import date, datetime
 import math
-from math import pi, sin, cos, tan, sqrt, radians, degrees
+from math import sin, cos, tan
 import warnings
 
 import numpy as np
@@ -8,9 +7,8 @@ import pandas as pd
 from astropy.time import Time, TimeDelta
 import astropy.units as u
 from astropy.utils import isiterable
-from astropy.coordinates import EarthLocation
-
-FYST_LOC = EarthLocation(lat='-22d59m08.30s', lon='-67d44m25.00s', height=5611.8*u.m)
+from .coordinates import FYST_LOC
+from fyst_trajectories.site import FYST_NASMYTH_PORT
 
 class Observation():
 
@@ -231,7 +229,11 @@ class Observation():
         return np.degrees(para_angle_rad)*u.deg
     
     def get_rot_angle(self, i):
-        return self.norm_angle(self.get_para_angle(i).value + self.get_elevation(i).value)*u.deg
+        # Nasmyth field rotation: nasmyth_sign * elevation + parallactic_angle
+        nasmyth_sign = 1 if FYST_NASMYTH_PORT == "right" else -1
+        return self.norm_angle(
+            self.get_para_angle(i).value + nasmyth_sign * self.get_elevation(i).value
+        ) * u.deg
 
     def get_hrang_range(self, i=None):
         # get hour angle representation

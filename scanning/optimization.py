@@ -4,7 +4,6 @@ import json
 from functools import wraps
 from astropy.convolution.convolve import convolve_fft
 from astropy.convolution.kernels import Gaussian2DKernel
-from astropy.utils.misc import isiterable
 
 import numpy as np
 import pandas as pd
