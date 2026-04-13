@@ -8,7 +8,8 @@ import pandas as pd
 from astropy.time import Time, TimeDelta
 import astropy.units as u
 from astropy.coordinates import SkyCoord
-from fyst_trajectories import get_fyst_site, Coordinates
+from fyst_trajectories import get_fyst_site, Coordinates, Trajectory, inject_retune
+from fyst_trajectories.trajectory import SCAN_FLAG_RETUNE
 from fyst_trajectories.offsets import InstrumentOffset, boresight_to_detector, detector_to_boresight
 from fyst_trajectories.site import FYST_NASMYTH_PORT
 from fyst_trajectories.patterns import (
@@ -800,6 +801,56 @@ class TelescopePattern():
         tp = cls(data, instrument=instrument, data_loc=data_loc, **kwargs)
         tp.scan_flag = getattr(trajectory, 'scan_flag', None)
         return tp
+
+    def inject_retune(self, interval=30.0, duration=5.0, **kwargs):
+        """Flag samples that fall during receiver retune events.
+
+        Wraps ``fyst_trajectories.inject_retune()`` for convenient use
+        within the scan_patterns workflow.  Retune flags are merged into
+        a ``retune_mask`` boolean array (True where the sample is a
+        retune) stored on the instance.
+
+        Parameters
+        ----------
+        interval : float
+            Seconds between retune events (default 30).
+        duration : float
+            Duration of each retune event in seconds (default 5).
+        **kwargs
+            Forwarded to ``fyst_trajectories.inject_retune()``
+            (e.g. ``prefer_turnarounds``, ``turnaround_window``).
+
+        Returns
+        -------
+        np.ndarray
+            Boolean mask (True = retune sample).
+        """
+        times = self.time_offset.to(u.s).value
+        az = self.az_coord.to(u.deg).value
+        el = self.alt_coord.to(u.deg).value
+        az_vel = _central_diff(az, self.sample_interval.value)
+        el_vel = _central_diff(el, self.sample_interval.value)
+
+        traj = Trajectory(
+            times=times,
+            az=az,
+            el=el,
+            az_vel=az_vel,
+            el_vel=el_vel,
+            scan_flag=getattr(self, 'scan_flag', None),
+        )
+
+        result = inject_retune(
+            traj,
+            retune_interval=interval,
+            retune_duration=duration,
+            **kwargs,
+        )
+
+        retune_mask = result.scan_flag == SCAN_FLAG_RETUNE
+        self.scan_flag = result.scan_flag
+        self.retune_mask = retune_mask
+        return retune_mask
 
     def _clean_param_sky_pattern(self, **kwargs):
         kwarg_keys = kwargs.keys()
