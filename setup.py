@@ -12,7 +12,7 @@ setup(
     install_requires=[
         'astropy>=4.3.1',
         'fast-histogram>=0.10',
-        'fyst-trajectories>=0.2.0',
+        'fyst-trajectories @ git+ssh://git@github.com/ccatobs/fyst-trajectories.git@main',
         'matplotlib>=3.4.3',
         'numpy>=1.21.2',
         'pandas>=1.3.2',
