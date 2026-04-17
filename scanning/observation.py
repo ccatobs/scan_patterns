@@ -7,8 +7,7 @@ import pandas as pd
 from astropy.time import Time, TimeDelta
 import astropy.units as u
 from astropy.utils import isiterable
-from .coordinates import FYST_LOC
-from fyst_trajectories.site import FYST_NASMYTH_PORT
+from .coordinates import FYST_LOC, _nasmyth_sign
 
 class Observation():
 
@@ -88,7 +87,7 @@ class Observation():
             self._ra = ra
 
             # get datetime range
-            datetime_range = pd.date_range(datetime_start, datetime_end, freq=freq, closed='left')
+            datetime_range = pd.date_range(datetime_start, datetime_end, freq=freq, inclusive='left')
             self._datetime_range = datetime_range.to_pydatetime()
         
         else:
@@ -229,10 +228,8 @@ class Observation():
         return np.degrees(para_angle_rad)*u.deg
     
     def get_rot_angle(self, i):
-        # Nasmyth field rotation: nasmyth_sign * elevation + parallactic_angle
-        nasmyth_sign = 1 if FYST_NASMYTH_PORT == "right" else -1
         return self.norm_angle(
-            self.get_para_angle(i).value + nasmyth_sign * self.get_elevation(i).value
+            self.get_para_angle(i).value + _nasmyth_sign() * self.get_elevation(i).value
         ) * u.deg
 
     def get_hrang_range(self, i=None):

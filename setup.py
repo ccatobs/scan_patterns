@@ -12,7 +12,8 @@ setup(
     install_requires=[
         'astropy>=4.3.1',
         'fast-histogram>=0.10',
-        'fyst-trajectories @ git+ssh://git@github.com/ccatobs/fyst-trajectories.git@main',
+        # TODO: pin to a tag/SHA once fyst-trajectories has versioned releases
+        'fyst-trajectories @ git+https://github.com/ccatobs/fyst-trajectories.git@main',
         'matplotlib>=3.4.3',
         'numpy>=1.21.2',
         'pandas>=1.3.2',

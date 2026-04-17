@@ -309,11 +309,11 @@ class Simulation():
         param = self._param
 
         if not param.get('pols_on') is None:
-            det_mask = np.in1d(module.pol.value, param['pols_on'])
+            det_mask = np.isin(module.pol.value, param['pols_on'])
         if not param.get('rhombi_on') is None:
-            det_mask = det_mask & np.in1d(module.rhombus, param['rhombi_on'])
+            det_mask = det_mask & np.isin(module.rhombus, param['rhombi_on'])
         if not param.get('wafers_on') is None:
-            det_mask = det_mask & np.in1d(module.wafer, param['wafers_on'])
+            det_mask = det_mask & np.isin(module.wafer, param['wafers_on'])
         
         if not param.get('det_radius') is None:
             radius = np.sqrt(module.x.value**2 + module.y.value**2)
@@ -324,7 +324,7 @@ class Simulation():
         if not param.get('det_list') is None:
             det_list = param['det_list']
             if len(np.shape(det_list)) == 1:
-                det_mask = det_mask & np.in1d(module.pixel_num, det_list)
+                det_mask = det_mask & np.isin(module.pixel_num, det_list)
             else:
                 det_list_mask = np.full(module.x.value.size, False)
                 for point in det_list:

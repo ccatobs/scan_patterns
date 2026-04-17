@@ -558,9 +558,8 @@ def filter_observation(obs, plot='elevation', min_elev=30, max_elev=75, min_rot_
         new_x[mask] = math.nan
         return new_x
 
-    # elevation   
+    # elevation
     if plot == 'elevation':
-        warnings.filterwarnings('ignore', category=RuntimeWarning)
         ax.set(
             title='Elevation', xlabel=xlabel,
             ylabel='Elevation [deg]', ylim=(min_elev, 87)
@@ -568,32 +567,36 @@ def filter_observation(obs, plot='elevation', min_elev=30, max_elev=75, min_rot_
         ax.set_yticks(np.append(ax.get_yticks(), max_elev))
         ax.axhline(max_elev, ls='dashed', color='black')
 
-        ax_elev_right = ax.secondary_yaxis('right', functions=( lambda x: 1/np.cos(np.radians(x)), lambda x: np.degrees(np.arccos(1/x)) ))
+        # Suppress div-by-zero from matplotlib's secondary_yaxis transform eval.
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', RuntimeWarning)
+            ax_elev_right = ax.secondary_yaxis('right', functions=( lambda x: 1/np.cos(np.radians(x)), lambda x: np.degrees(np.arccos(1/x)) ))
         ax_elev_right.set(ylabel='Azimuthal Scale Factor')
         ax_elev_right.set_yticks([1.2, 2, 3, 4, 5, 6, 15])
 
     # airmass
     elif plot == 'airmass':
-        warnings.filterwarnings('ignore', category=RuntimeWarning)
         ax.set_yscale('function', functions=(lambda x: np.log10(x), lambda x: 10**x))
         max_airmass = 1/cos(pi/2 - radians(min_elev))
         ax.set(
-            title='Airmass', xlabel=xlabel, 
+            title='Airmass', xlabel=xlabel,
             ylabel='Airmass', ylim=(1.001, max_airmass)
         )
         ax.invert_yaxis()
         ax.axhline(1/cos(pi/2 - radians(max_elev)), ls='dashed', color='black')
 
-        ax_airmass_right = ax.secondary_yaxis('right', functions=(transform, inverse))
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', RuntimeWarning)
+            ax_airmass_right = ax.secondary_yaxis('right', functions=(transform, inverse))
         ax_airmass_right.set(ylabel='Azimuthal Scale Factor')
         ax_airmass_right.set_yticks([1.2, 1.5, 2, 2.5, 3, 4])
     
-    # parallatic angle
-    elif plot == 'para_ang':
+    # parallactic angle
+    elif plot == 'para_angle':
         ax.set(title='Parallactic Angle', xlabel=xlabel, ylabel='Parallactic Angle [deg]')
 
     # rotation angle
-    elif plot == 'rot_ang':
+    elif plot == 'rot_angle':
         ax.set(title='Field Rotation Angle', xlabel=xlabel, ylabel='Field Rotation Angle [deg]')
 
     # rotation rate

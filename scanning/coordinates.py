@@ -8,13 +8,44 @@ import pandas as pd
 from astropy.time import Time, TimeDelta
 import astropy.units as u
 from astropy.coordinates import SkyCoord
-from fyst_trajectories import get_fyst_site, Coordinates, Trajectory, inject_retune
-from fyst_trajectories.trajectory import SCAN_FLAG_RETUNE
+from fyst_trajectories import (
+    AtmosphericConditions,
+    Coordinates,
+    Trajectory,
+    get_fyst_site,
+    inject_retune,
+)
+from fyst_trajectories.trajectory import (
+    SCAN_FLAG_RETUNE,
+    SCAN_FLAG_SCIENCE,
+    SCAN_FLAG_TURNAROUND,
+)
 from fyst_trajectories.offsets import InstrumentOffset, boresight_to_detector, detector_to_boresight
 from fyst_trajectories.site import FYST_NASMYTH_PORT
 from fyst_trajectories.patterns import (
     PongScanPattern, DaisyScanPattern, PongScanConfig, DaisyScanConfig,
+    compute_pong_period,
 )
+
+try:
+    # Preferred: surface convergence warnings as PointingWarning so callers
+    # filtering on fyst-trajectories' warning category catch them.
+    from fyst_trajectories import PointingWarning
+except ImportError:  # pragma: no cover - older fyst-trajectories without this export
+    PointingWarning = UserWarning
+
+
+# --- Module-level constants ---
+
+# Fixed-point iteration limits for _transform_to_boresight (converges in <5 iters).
+_BORESIGHT_MAX_ITER = 20
+_BORESIGHT_TOLERANCE_DEG = 1e-12
+
+
+def _nasmyth_sign():
+    """Return +1 (right) or -1 (left) for the FYST Nasmyth port."""
+    return 1 if FYST_NASMYTH_PORT == "right" else -1
+
 
 def _central_diff(a, h=None, time=None):
 
@@ -22,7 +53,7 @@ def _central_diff(a, h=None, time=None):
     if h is None:
         h = time[1] - time[0]
 
-    # get derivative 
+    # get derivative
     a = np.array(a)
     len_a = len(a)
 
@@ -32,6 +63,24 @@ def _central_diff(a, h=None, time=None):
     new_a[-1] = (a[-1] - a[-2])/h
 
     return new_a
+
+
+# Speed threshold for science/turnaround classification (matches upstream 0.8).
+_SCAN_FLAG_SPEED_FRACTION: float = 0.8
+
+
+def _scan_flag_from_offsets(times, x_off, y_off, velocity):
+    """Classify samples as SCIENCE vs TURNAROUND from offset-frame speed."""
+    n = len(times)
+    if n < 2:
+        return np.full(n, SCAN_FLAG_SCIENCE, dtype=np.int8)
+    x_vel = np.gradient(x_off, times)
+    y_vel = np.gradient(y_off, times)
+    speed = np.sqrt(x_vel**2 + y_vel**2)
+    flag = np.full(n, SCAN_FLAG_TURNAROUND, dtype=np.int8)
+    flag[speed >= _SCAN_FLAG_SPEED_FRACTION * velocity] = SCAN_FLAG_SCIENCE
+    return flag
+
 
 FYST_LOC = get_fyst_site().location
 
@@ -87,7 +136,9 @@ class SkyPattern():
         >>> SkyPattern('file.csv', units={'x_coord': 'arcsec'})
         """
 
-        self._repeatable = repeatable 
+        self._repeatable = repeatable
+        # Populated by Pong/Daisy; None for user-supplied SkyPatterns.
+        self._scan_flag = None
 
         try:
             if isinstance(data, str):
@@ -163,7 +214,7 @@ class SkyPattern():
                 data_temp['time_offset'] = time_offset + one_scan_duration*i
                 data_temp['x_coord'] = x_coord
                 data_temp['y_coord'] = y_coord
-                data = data.append(data_temp, ignore_index=True)
+                data = pd.concat([data, data_temp], ignore_index=True)
 
         return data
 
@@ -449,11 +500,6 @@ class Pong(SkyPattern):
         velocity = self._param['velocity']
         sample_interval = self._param['sample_interval']
 
-        # Compute period for num_repeat / max_scan_duration handling
-        vert_spacing = sqrt(2) * spacing
-        vavg = velocity / sqrt(2)
-
-        # Use fyst-trajectories's vertex computation (identical algorithm)
         config = PongScanConfig(
             num_terms=self._param['num_term'],
             width=width,
@@ -463,10 +509,8 @@ class Pong(SkyPattern):
             timestep=sample_interval,
             angle=self._param['angle'],
         )
-        pattern = PongScanPattern(ra=0.0, dec=0.0, config=config)
-        x_numvert, y_numvert, _, _ = pattern._compute_vertices()
 
-        period = x_numvert * y_numvert * vert_spacing * 2 / vavg
+        period, _x_numvert, _y_numvert = compute_pong_period(config)
 
         # Determine number of repeats
         num_repeat = self._param.get('num_repeat', 1)
@@ -478,14 +522,13 @@ class Pong(SkyPattern):
 
         self._param['period'] = period
 
-        # Compute duration to match original point count:
-        # pongcount = ceil(period * num_repeat / sample_interval)
-        # duration = (pongcount - 1) * sample_interval
         pongcount = math.ceil(period * num_repeat / sample_interval)
         duration = (pongcount - 1) * sample_interval
 
-        # Generate offsets via fyst-trajectories
+        pattern = PongScanPattern(ra=0.0, dec=0.0, config=config)
         times, x_off, y_off = pattern.generate_offsets(duration=duration)
+
+        self._scan_flag = _scan_flag_from_offsets(times, x_off, y_off, velocity)
 
         return pd.DataFrame({
             'time_offset': times,
@@ -577,7 +620,6 @@ class Daisy(SkyPattern):
         # unpack parameters (already cleaned to floats in degrees/seconds)
         T = self._param['T']
 
-        # Generate offsets via fyst-trajectories
         config = DaisyScanConfig(
             radius=self._param['R0'],
             velocity=self._param['velocity'],
@@ -589,6 +631,10 @@ class Daisy(SkyPattern):
         )
         pattern = DaisyScanPattern(ra=0.0, dec=0.0, config=config)
         times, x_off, y_off = pattern.generate_offsets(duration=T)
+
+        self._scan_flag = _scan_flag_from_offsets(
+            times, x_off, y_off, self._param['velocity'],
+        )
 
         return pd.DataFrame({
             'time_offset': times,
@@ -679,6 +725,8 @@ class TelescopePattern():
 
         """
 
+        self.scan_flag = None
+
         # --- Observation Parameters ---
 
         # pass by obs_param
@@ -696,7 +744,7 @@ class TelescopePattern():
 
         # sky_pattern has been passed
         if isinstance(data, SkyPattern):
-                
+
             self._param = self._clean_param_sky_pattern(**param)
 
             self._sample_interval = data.sample_interval.value
@@ -706,6 +754,11 @@ class TelescopePattern():
 
             self._data['az_coord'] = az1
             self._data['alt_coord'] = alt1
+
+            # Propagate scan_flag from SkyPattern (Pong/Daisy) for inject_retune.
+            sky_flag = getattr(data, '_scan_flag', None)
+            if sky_flag is not None:
+                self.scan_flag = np.asarray(sky_flag)
 
         # data has been passed
         else:
@@ -770,16 +823,13 @@ class TelescopePattern():
         Parameters
         ----------
         trajectory : fyst_trajectories.Trajectory
-            A trajectory generated by fyst-trajectories (e.g., from ConstantElScanPattern).
-            Must have a start_time set. The trajectory must have uniform timesteps
-            (scan_patterns requires a constant sample interval). ``trajectory.times``
-            should be seconds from zero.
+            Must have ``start_time`` set and uniform timesteps.
         instrument : Instrument, optional
             Instrument for detector offset calculations.
         data_loc : str, optional
             Module location for scanning center. Default 'boresight'.
         **kwargs
-            Additional keyword arguments passed to TelescopePattern.__init__.
+            Forwarded to ``TelescopePattern.__init__``.
         """
         if trajectory.start_time is None:
             raise ValueError("Trajectory must have start_time set")
@@ -799,26 +849,23 @@ class TelescopePattern():
         })
 
         tp = cls(data, instrument=instrument, data_loc=data_loc, **kwargs)
-        tp.scan_flag = getattr(trajectory, 'scan_flag', None)
+        tp.scan_flag = trajectory.scan_flag
         return tp
 
-    def inject_retune(self, interval=30.0, duration=5.0, **kwargs):
-        """Flag samples that fall during receiver retune events.
+    def inject_retune(self, interval=300.0, duration=5.0, **kwargs):
+        """Flag samples during receiver retune events.
 
-        Wraps ``fyst_trajectories.inject_retune()`` for convenient use
-        within the scan_patterns workflow.  Retune flags are merged into
-        a ``retune_mask`` boolean array (True where the sample is a
-        retune) stored on the instance.
+        Wraps ``fyst_trajectories.inject_retune()``. Stores a
+        ``retune_mask`` boolean array on the instance.
 
         Parameters
         ----------
         interval : float
-            Seconds between retune events (default 30).
+            Seconds between retune events (default 300).
         duration : float
             Duration of each retune event in seconds (default 5).
         **kwargs
-            Forwarded to ``fyst_trajectories.inject_retune()``
-            (e.g. ``prefer_turnarounds``, ``turnaround_window``).
+            Forwarded to ``fyst_trajectories.inject_retune()``.
 
         Returns
         -------
@@ -837,7 +884,7 @@ class TelescopePattern():
             el=el,
             az_vel=az_vel,
             el_vel=el_vel,
-            scan_flag=getattr(self, 'scan_flag', None),
+            scan_flag=self.scan_flag,
         )
 
         result = inject_retune(
@@ -912,10 +959,9 @@ class TelescopePattern():
         param = self.param
 
         if 'start_datetime' in self._param:
-            # Use fyst-trajectories for accurate conversion (spherical offsets,
-            # apparent sidereal time, precession/nutation).
+            # Use fyst-trajectories for accurate radec->altaz with refraction.
             site = get_fyst_site()
-            coords = Coordinates(site)
+            coords = Coordinates(site, atmosphere=AtmosphericConditions.for_fyst())
 
             start_time = Time(param['start_datetime'])
             dt_seconds = sky_pattern.time_offset.to(u.s).value
@@ -1057,11 +1103,7 @@ class TelescopePattern():
             return self.instrument.location_from_boresight(module[0], module[1]).value
 
     def _transform_to_boresight(self, az1, alt1, dist, theta):
-        # Use fyst-trajectories's spherical offset (inverse direction).
-        # Same convention mapping as _transform_from_boresight:
-        #   dx = dist * cos(theta), dy = dist * sin(theta), field_rotation = -el_bore
-        # The field_rotation depends on the unknown boresight elevation, so we
-        # iterate: guess el_bore, invert, update guess, repeat.
+        # Invert detector->boresight via fixed-point iteration on elevation.
         theta_rad = math.radians(theta)
         dx_arcmin = dist * 60.0 * math.cos(theta_rad)
         dy_arcmin = dist * 60.0 * math.sin(theta_rad)
@@ -1072,15 +1114,31 @@ class TelescopePattern():
 
         # Initial guess: boresight elevation ~ detector elevation
         bore_el = alt1.copy()
+        max_delta = math.inf
+        iter_count = 0
+        nas_sign = _nasmyth_sign()
 
-        for _ in range(20):
+        for iter_count in range(1, _BORESIGHT_MAX_ITER + 1):
             bore_az, bore_el_new = detector_to_boresight(
-                az1, alt1, offset, field_rotation=-bore_el,
+                az1, alt1, offset, field_rotation=-nas_sign * bore_el,
             )
             max_delta = np.max(np.abs(bore_el_new - bore_el))
             bore_el = bore_el_new
-            if max_delta < 1e-12:
+            if max_delta < _BORESIGHT_TOLERANCE_DEG:
                 break
+        else:
+            worst_idx = int(np.argmax(np.abs(bore_el_new - alt1)))
+            warnings.warn(
+                "_transform_to_boresight did not converge after "
+                f"{iter_count} iterations (max elevation delta = "
+                f"{max_delta:.3e} deg, tolerance = "
+                f"{_BORESIGHT_TOLERANCE_DEG:.1e} deg). "
+                f"Worst-case input: az={az1[worst_idx]:.6f} deg, "
+                f"alt={alt1[worst_idx]:.6f} deg "
+                f"(dist={dist} deg, theta={theta} deg).",
+                PointingWarning,
+                stacklevel=2,
+            )
 
         if np.any(bore_el < 0):
             warnings.warn('elevation has values below 0')
@@ -1088,17 +1146,15 @@ class TelescopePattern():
         return self._norm_angle(np.asarray(bore_az)), np.asarray(bore_el)
 
     def _transform_from_boresight(self, az0, alt0, dist, theta):
-        # Use fyst-trajectories's spherical offset (forward direction).
-        # scan_patterns convention: (dist, theta) where theta is measured from
-        # the cross-elevation axis in the Nasmyth focal plane. The sky-frame
-        # position angle is (theta + elevation). Mapping to fyst-trajectories:
-        #   dx = dist * cos(theta), dy = dist * sin(theta), field_rotation = -el
+        # Boresight -> detector via spherical offset with Nasmyth field rotation.
         theta_rad = math.radians(theta)
         dx_arcmin = dist * 60.0 * math.cos(theta_rad)
         dy_arcmin = dist * 60.0 * math.sin(theta_rad)
         offset = InstrumentOffset(dx=dx_arcmin, dy=dy_arcmin)
 
-        det_az, det_el = boresight_to_detector(az0, alt0, offset, field_rotation=-alt0)
+        det_az, det_el = boresight_to_detector(
+            az0, alt0, offset, field_rotation=-_nasmyth_sign() * alt0,
+        )
 
         if np.any(np.asarray(det_el) < 0):
             warnings.warn('elevation has values below 0')
@@ -1347,9 +1403,8 @@ class TelescopePattern():
 
     @property
     def rot_angle(self):
-        """Quantity array: Field rotation (nasmyth_sign * elevation + parallactic angle)."""
-        nasmyth_sign = 1 if FYST_NASMYTH_PORT == "right" else -1
-        return self._norm_angle((nasmyth_sign * self.alt_coord + self.para_angle).value)*u.deg
+        """Quantity array: Nasmyth field rotation angle."""
+        return self._norm_angle((_nasmyth_sign() * self.alt_coord + self.para_angle).value)*u.deg
 
     # Azimuthal/Elevation Motion
 
