@@ -861,16 +861,41 @@ class TelescopePattern():
         Parameters
         ----------
         interval : float
-            Seconds between retune events (default 300).
+            Seconds between retune events (default 300). Ignored when an
+            explicit ``retune_events`` sequence is forwarded via kwargs.
         duration : float
-            Duration of each retune event in seconds (default 5).
+            Duration of each retune event in seconds (default 5). Ignored
+            when an explicit ``retune_events`` sequence is forwarded via
+            kwargs.
         **kwargs
-            Forwarded to ``fyst_trajectories.inject_retune()``.
+            Forwarded to ``fyst_trajectories.inject_retune()``. In
+            particular, passing ``retune_events=[RetuneEvent(...), ...]``
+            switches the underlying call to event-list mode; ``interval``
+            and ``duration`` are then ignored by the upstream function.
+            See the fyst-trajectories ``retune_events`` sphinx page
+            (``docs/retune_events.rst``) for the CSV schema and ECSV
+            round-trip semantics.
 
         Returns
         -------
         np.ndarray
             Boolean mask (True = retune sample).
+
+        Examples
+        --------
+        Uniform-cadence mode (the default)::
+
+            telescope_pattern.inject_retune(interval=300.0, duration=5.0)
+
+        Event-list mode::
+
+            from fyst_trajectories import RetuneEvent
+
+            events = [
+                RetuneEvent(t_start=30.0, duration=5.0),
+                RetuneEvent(t_start=300.0, duration=5.0),
+            ]
+            telescope_pattern.inject_retune(retune_events=events)
         """
         times = self.time_offset.to(u.s).value
         az = self.az_coord.to(u.deg).value
